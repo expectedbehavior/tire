@@ -51,6 +51,22 @@ module Tire
       reset_variables.each { |v| instance_variable_set(v.to_sym, nil) }
     end
 
+    def self.http_max_content_length(value=nil)
+      if value
+        @http_max_content_length = value
+      else
+        @http_max_content_length || 104857600
+      end
+    end
+
+    def self.timeout(value=nil)
+      if value
+        @timeout = value
+      else
+        @timeout
+      end
+    end
+
   end
 
 end

@@ -162,6 +162,8 @@ module Tire
     #
     # Shortcut methods `bulk_store`, `bulk_delete` and `bulk_create` are available.
     #
+    # This method is updated to take into consideration the HTTP max content length and break down the requests
+    # to fit within that size
     def bulk(action, documents, options={})
       return false if documents.empty?
 
@@ -172,8 +174,14 @@ module Tire
       #       delete id: 1
       #       # ...
       #     end
-
-      payload = documents.map do |document|
+      post_payload_response = nil
+      payload = AutoFlushingBuffer.new Configuration.http_max_content_length
+      payload.on_flush do |buffer|
+        if buffer.size > 0
+          post_payload_response = post_payload buffer, options
+        end
+      end
+      documents.map do |document|
         type = get_type_from_document(document, :escape => false) # Do not URL-escape the _type
         id   = get_id_from_document(document)
 
@@ -207,39 +215,16 @@ module Tire
         output = []
         output << MultiJson.encode(header)
         output << convert_document_to_json(document) unless action.to_s == 'delete'
-        output.join("\n")
-      end
-      payload << ""
-
-      tries = 5
-      count = 0
-
-      begin
-        params = {}
-        params[:consistency] = options.delete(:consistency)
-        params[:refresh]     = options.delete(:refresh)
-        params               = params.reject { |name,value| !value }
-        params_encoded       = params.empty? ? '' : "?#{params.to_param}"
-
-        @response = Configuration.client.post("#{url}/_bulk#{params_encoded}", payload.join("\n"))
-        raise RuntimeError, "#{@response.code} > #{@response.body}" if @response && @response.failure?
-        @response
-      rescue StandardError => error
-        if count < tries
-          count += 1
-          STDERR.puts "[ERROR] #{error.message}, retrying (#{count})..."
-          retry
-        else
-          STDERR.puts "[ERROR] Too many exceptions occured, giving up. The HTTP response was: #{error.message}"
+        output << ''
+        begin
+          payload << output.join("\n")
+        rescue PushLargerThanBufferException => error
+          STDERR.puts "[ERROR] #{error.message}"
           raise if options[:raise]
         end
-
-      ensure
-        data = Configuration.logger && Configuration.logger.level.to_s == 'verbose' ? payload.join("\n") : '... data omitted ...'
-        curl = %Q|curl -X POST "#{url}/_bulk" --data-binary '#{data}'|
-        logged('_bulk', curl)
       end
-
+      payload.flush
+      post_payload_response
     end
 
     def bulk_create(documents, options={})
@@ -274,7 +259,7 @@ module Tire
 
         else
           raise ArgumentError, "Please pass either an Enumerable compatible class, or a collection object " +
-                               "with a method for fetching records in batches (such as 'paginate')."
+              "with a method for fetching records in batches (such as 'paginate')."
       end
     end
 
@@ -459,11 +444,11 @@ module Tire
 
         if Configuration.logger.level.to_s == 'debug'
           body = if @response && @response.body && !@response.body.to_s.empty?
-              MultiJson.encode( MultiJson.load(@response.body), :pretty => Configuration.pretty)
-            elsif error && error.message && !error.message.to_s.empty?
-              MultiJson.encode( MultiJson.load(error.message), :pretty => Configuration.pretty) rescue ''
-            else ''
-          end
+                   MultiJson.encode( MultiJson.load(@response.body), :pretty => Configuration.pretty)
+                 elsif error && error.message && !error.message.to_s.empty?
+                   MultiJson.encode( MultiJson.load(error.message), :pretty => Configuration.pretty) rescue ''
+                 else ''
+                 end
         else
           body = ''
         end
@@ -477,15 +462,15 @@ module Tire
 
       old_verbose, $VERBOSE = $VERBOSE, nil # Silence Object#type deprecation warnings
       type = case
-        when document.respond_to?(:document_type)
-          document.document_type
-        when document.is_a?(Hash)
-          document[:_type] || document['_type'] || document[:type] || document['type']
-        when document.respond_to?(:_type)
-          document._type
-        when document.respond_to?(:type) && document.type != document.class
-          document.type
-        end
+               when document.respond_to?(:document_type)
+                 document.document_type
+               when document.is_a?(Hash)
+                 document[:_type] || document['_type'] || document[:type] || document['type']
+               when document.respond_to?(:_type)
+                 document._type
+               when document.respond_to?(:type) && document.type != document.class
+                 document.type
+             end
       $VERBOSE = old_verbose
 
       type ||= 'document'
@@ -495,26 +480,61 @@ module Tire
     def get_id_from_document(document)
       old_verbose, $VERBOSE = $VERBOSE, nil # Silence Object#id deprecation warnings
       id = case
-        when document.is_a?(Hash)
-          document[:_id] || document['_id'] || document[:id] || document['id']
-        when document.respond_to?(:id) && document.id != document.object_id
-          document.id.to_s
-      end
+             when document.is_a?(Hash)
+               document[:_id] || document['_id'] || document[:id] || document['id']
+             when document.respond_to?(:id) && document.id != document.object_id
+               document.id.to_s
+           end
       $VERBOSE = old_verbose
       id
     end
 
     def convert_document_to_json(document)
       document = case
-        when document.is_a?(String)
-          if ENV['DEBUG']
-            Tire.warn "Passing the document as JSON string has been deprecated, " +
-                       "please pass an object which responds to `to_indexed_json` or a plain Hash."
-          end
-          document
-        when document.respond_to?(:to_indexed_json) then document.to_indexed_json
-        else raise ArgumentError, "Please pass a JSON string or object with a 'to_indexed_json' method," +
-                                  "'#{document.class}' given."
+                   when document.is_a?(String)
+                     if ENV['DEBUG']
+                       Tire.warn "Passing the document as JSON string has been deprecated, " +
+                                     "please pass an object which responds to `to_indexed_json` or a plain Hash."
+                     end
+                     document
+                   when document.respond_to?(:to_indexed_json) then document.to_indexed_json
+                   else raise ArgumentError, "Please pass a JSON string or object with a 'to_indexed_json' method," +
+                       "'#{document.class}' given."
+                 end
+    end
+
+    private
+
+    def post_payload(payload, options={})
+      payload << ""
+      tries = 5
+      count = 0
+      data = payload.join("")
+
+      begin
+        params = {}
+        params[:consistency] = options.delete(:consistency)
+        params[:refresh]     = options.delete(:refresh)
+        params               = params.reject { |name,value| !value }
+        params_encoded       = params.empty? ? '' : "?#{params.to_param}"
+
+        @response = Configuration.client.post("#{url}/_bulk#{params_encoded}", data)
+        raise RuntimeError, "#{@response.code} > #{@response.body}" if @response && @response.failure?
+        @response
+      rescue StandardError => error
+        if count < tries
+          count += 1
+          STDERR.puts "[ERROR] #{error.message}, retrying (#{count})..."
+          retry
+        else
+          STDERR.puts "[ERROR] Too many exceptions occured, giving up. The HTTP response was: #{error.message}"
+          raise if options[:raise]
+        end
+
+      ensure
+        data = Configuration.logger && Configuration.logger.level.to_s == 'verbose' ? data : '... data omitted ...'
+        curl = %Q|curl -X POST "#{url}/_bulk" --data-binary '#{data}'|
+        logged('_bulk', curl)
       end
     end
 

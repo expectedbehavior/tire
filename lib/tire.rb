@@ -15,6 +15,7 @@ require 'tire/rubyext/ruby_1_8' if defined?(RUBY_VERSION) && RUBY_VERSION < '1.9
 require 'tire/version'
 require 'tire/rubyext/hash'
 require 'tire/rubyext/symbol'
+require 'tire/support/auto_flushing_buffer'
 require 'tire/utils'
 require 'tire/logger'
 require 'tire/configuration'
